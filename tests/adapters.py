@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Type
 
 import torch
-
+from tests.func.flash_attn import FlashAttention2_PyTorch
 
 
 def get_flashattention_autograd_function_pytorch() -> Type:
@@ -16,7 +16,8 @@ def get_flashattention_autograd_function_pytorch() -> Type:
         A class object (not an instance of the class)
     """
     # For example: return MyFlashAttnAutogradFunctionClass
-    raise NotImplementedError
+    return FlashAttention2_PyTorch
+
 
 
 def get_flashattention_autograd_function_triton() -> Type:
