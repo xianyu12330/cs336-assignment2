@@ -2,8 +2,8 @@ import math
 from typing import Any
 
 import torch
-import triton
-import triton.language as tl
+# import triton
+# import triton.language as tl
 from sympy import false
 
 
@@ -19,16 +19,16 @@ def flash_bwd_recompute_impl(q: torch.Tensor,
     scale = 1.0 / math.sqrt(D)
     s = torch.matmul(q, k.transpose(-1, -2)) * scale
     if is_causal:
-        q_idx = torch.arange(S, device=q.device)[:, None]
-        k_idx = torch.arange(K, device=k.device)[None, :]
+        q_idx = torch.arange(S, device=s.device)[:, None]
+        k_idx = torch.arange(K, device=s.device)[None, :]
         causal = q_idx >= k_idx  # []s,k
-        Score = torch.where(causal[None, :, :], s, torch.full_like(s, -1.0e6))  # [s,k] ->[1,s,k]
+        s = torch.where(causal[None, :, :], s, torch.full_like(s, -1.0e6))  # [s,k] ->[1,s,k]
     # Pij = exp (Sij − Li)->[b,s,k]
-    p = torch.exp(Score - L.unsqueeze(-1))
+    p = torch.exp(s - L.unsqueeze(-1))
     # dV = P⊤dO->[b,k,d]
     dv = torch.matmul(p.transpose(-1, -2), do)
     # dP = dOV⊤
-    dp = torch.matmul(do, torch.transpose(v, -1, -2))
+    dp = torch.matmul(do, v.transpose(v, -1, -2))
     # dSij = Pij ◦ (dPij − Di)
     Devc = (do * o).sum(-1)  # [b,s]
     ds = p * (dp - Devc.unsqueeze(-1)) * scale
@@ -113,116 +113,116 @@ class FlashAttention2_PyTorch(torch.autograd.Function):
         (L, q, k, v, o) = ctx.saved_tensors
         dq, dk, dv = flash_bwd_recompute_impl(q, k, v, o, do, L, ctx.is_causal)
         return dq, dk, dv, None
-@triton.jit
-def flash_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr,#指向数据在显存中起始位置的基指针
-    O_ptr, L_ptr,#Output输出矩阵和logsumexp辅助矩阵的指针
-    stride_qb, #移动到下一个 Batch 需要跳过的距离。
-    stride_qq, #移动到下一个 Query 序列位置需要跳过的距离。
-    stride_qd,#移动到下一个特征维度需要跳过的距离。
-    stride_kb, stride_kk, stride_kd,
-    stride_vb, stride_vk, stride_vd,
-    stride_ob, stride_oq, stride_od,# Output的 strides
-    stride_lb, stride_lq, # Logsumexp的 strides
-    N_QUERIES, #相当于总大小
-    N_KEYS,# query,key/value序列的长度
-    scale,
-    D: tl.constexpr,# 每个头的维度
-    Q_TILE_SIZE: tl.constexpr,#Bq，分块长度，每个 program 处理的数据块大小
-    K_TILE_SIZE: tl.constexpr,#Bk
-    IS_CAUSAL: tl.constexpr
-):
-    #当前这段代码负责处理的块的坐标。
-    pid_q = tl.program_id(0)
-    #表示当前是第几个 Batch
-    pid_b = tl.program_id(1)
-    #每个 program instance 负责：一个 batch 的一个 Q tile
-    #每个 block 计算：Q[pid_b, pid_q_tile, :]，每个块的内存范围
-    q_offsets = pid_q * Q_TILE_SIZE + tl.arange(0,Q_TILE_SIZE)
-    d_offsets = tl.arange(0,D)
-    #构造地址Q[pid_b, q_offsets[i], d_offsets[j]]，最终是【bq，d】的指针矩阵
-    q_ptrs = Q_ptr \
-            + pid_b * stride_qb \
-            + q_offsets[:,None] * stride_qq \
-            + d_offsets[None:,] * stride_qd
-    q = tl.load(q_ptrs,mask=(q_offsets[:,None] < N_QUERIES),other=0.0).to(tl.float32)
-    #初始化 Online Softmax 状态
-    ## 当前最大值
-    m = tl.full((Q_TILE_SIZE,), -float("inf"),tl.float32)#[bq]
-    ## 当前 softmax 分母
-    l = tl.zeros((Q_TILE_SIZE,),tl.float32)
-    ## 当前加权和
-    acc = tl.zeros((Q_TILE_SIZE,D),tl.float32)
-    #每次处理一个 K block
-    for kb in tl.static_range(0,N_KEYS,K_TILE_SIZE):
-        k_offsets = kb + tl.arange(0,K_TILE_SIZE)
-        k_ptrs = K_ptr + pid_b * stride_kb + k_offsets[:,None] * stride_kk
-        v_ptrs = V_ptr + pid_b * stride_vb + k_offsets[:,None] * stride_vk
-        k = tl.load(k_ptrs,mask=(k_offsets[:,None] < N_KEYS),other=0.0).to(tl.float32)
-        v = tl.load(v_ptrs,mask=(k_offsets[:,None] < N_KEYS),other=0.0)
+# @triton.jit
+# def flash_fwd_kernel(
+#     Q_ptr, K_ptr, V_ptr,#指向数据在显存中起始位置的基指针
+#     O_ptr, L_ptr,#Output输出矩阵和logsumexp辅助矩阵的指针
+#     stride_qb, #移动到下一个 Batch 需要跳过的距离。
+#     stride_qq, #移动到下一个 Query 序列位置需要跳过的距离。
+#     stride_qd,#移动到下一个特征维度需要跳过的距离。
+#     stride_kb, stride_kk, stride_kd,
+#     stride_vb, stride_vk, stride_vd,
+#     stride_ob, stride_oq, stride_od,# Output的 strides
+#     stride_lb, stride_lq, # Logsumexp的 strides
+#     N_QUERIES, #相当于总大小
+#     N_KEYS,# query,key/value序列的长度
+#     scale,
+#     D: tl.constexpr,# 每个头的维度
+#     Q_TILE_SIZE: tl.constexpr,#Bq，分块长度，每个 program 处理的数据块大小
+#     K_TILE_SIZE: tl.constexpr,#Bk
+#     IS_CAUSAL: tl.constexpr
+# ):
+#     #当前这段代码负责处理的块的坐标。
+#     pid_q = tl.program_id(0)
+#     #表示当前是第几个 Batch
+#     pid_b = tl.program_id(1)
+#     #每个 program instance 负责：一个 batch 的一个 Q tile
+#     #每个 block 计算：Q[pid_b, pid_q_tile, :]，每个块的内存范围
+#     q_offsets = pid_q * Q_TILE_SIZE + tl.arange(0,Q_TILE_SIZE)
+#     d_offsets = tl.arange(0,D)
+#     #构造地址Q[pid_b, q_offsets[i], d_offsets[j]]，最终是【bq，d】的指针矩阵
+#     q_ptrs = Q_ptr \
+#             + pid_b * stride_qb \
+#             + q_offsets[:,None] * stride_qq \
+#             + d_offsets[None:,] * stride_qd
+#     q = tl.load(q_ptrs,mask=(q_offsets[:,None] < N_QUERIES),other=0.0).to(tl.float32)
+#     #初始化 Online Softmax 状态
+#     ## 当前最大值
+#     m = tl.full((Q_TILE_SIZE,), -float("inf"),tl.float32)#[bq]
+#     ## 当前 softmax 分母
+#     l = tl.zeros((Q_TILE_SIZE,),tl.float32)
+#     ## 当前加权和
+#     acc = tl.zeros((Q_TILE_SIZE,D),tl.float32)
+#     #每次处理一个 K block
+#     for kb in tl.static_range(0,N_KEYS,K_TILE_SIZE):
+#         k_offsets = kb + tl.arange(0,K_TILE_SIZE)
+#         k_ptrs = K_ptr + pid_b * stride_kb + k_offsets[:,None] * stride_kk
+#         v_ptrs = V_ptr + pid_b * stride_vb + k_offsets[:,None] * stride_vk
+#         k = tl.load(k_ptrs,mask=(k_offsets[:,None] < N_KEYS),other=0.0).to(tl.float32)
+#         v = tl.load(v_ptrs,mask=(k_offsets[:,None] < N_KEYS),other=0.0)
+#
+#         # S = q @ k^T * scale -> [Bq, Bk]
+#         S = tl.dot(q,tl.trans(k)) * scale
+#         #强制 attention 只看过去 token
+#         if IS_CAUSAL:
+#             #q，k的相对位置
+#             q_ads = q_offsets[:,None] #[bq,1]
+#             k_ads = k_offsets[None,:] #[1,bk]
+#             causal = q_ads >= k_ads
+#             S = tl.where(causal,S,-1.0e6)
+#
+#         # online softmax update
+#         m_new = tl.maximum(m,tl.max(S,axis=1))
+#         #计算当前块的 exp
+#         p = tl.exp(S - m_new[:,None])
+#         #修正旧分母
+#         alpha = tl.exp(m - m_new)
+#         l_new = alpha * l + tl.sum(p,axis=1)
+#         #更新输出累加
+#         p = p.to(v.dtype)
+#         acc = alpha[:,None] * acc + tl.dot(p,v)
+#         #计算最终输出
+#         m = m_new
+#         l = l_new
+#     o = acc / l[:,None]
+#     o = o.to(tl.float32)
+#     o_ptrs = O_ptr + pid_b * stride_ob + q_offsets[:, None] * stride_oq + d_offsets[None, :] * stride_od
+#     tl.store(o_ptrs, o, mask=(q_offsets[:, None] < N_QUERIES))
+#
+#     L_out = m + tl.log(l)  # [Bq]
+#     l_ptrs = L_ptr + pid_b * stride_lb + q_offsets * stride_lq
+#     tl.store(l_ptrs, L_out, mask=(q_offsets < N_QUERIES))
 
-        # S = q @ k^T * scale -> [Bq, Bk]
-        S = tl.dot(q,tl.trans(k)) * scale
-        #强制 attention 只看过去 token
-        if IS_CAUSAL:
-            #q，k的相对位置
-            q_ads = q_offsets[:,None] #[bq,1]
-            k_ads = k_offsets[None,:] #[1,bk]
-            causal = q_ads >= k_ads
-            S = tl.where(causal,S,-1.0e6)
-
-        # online softmax update
-        m_new = tl.maximum(m,tl.max(S,axis=1))
-        #计算当前块的 exp
-        p = tl.exp(S - m_new[:,None])
-        #修正旧分母
-        alpha = tl.exp(m - m_new)
-        l_new = alpha * l + tl.sum(p,axis=1)
-        #更新输出累加
-        p = p.to(v.dtype)
-        acc = alpha[:,None] * acc + tl.dot(p,v)
-        #计算最终输出
-        m = m_new
-        l = l_new
-    o = acc / l[:,None]
-    o = o.to(tl.float32)
-    o_ptrs = O_ptr + pid_b * stride_ob + q_offsets[:, None] * stride_oq + d_offsets[None, :] * stride_od
-    tl.store(o_ptrs, o, mask=(q_offsets[:, None] < N_QUERIES))
-
-    L_out = m + tl.log(l)  # [Bq]
-    l_ptrs = L_ptr + pid_b * stride_lb + q_offsets * stride_lq
-    tl.store(l_ptrs, L_out, mask=(q_offsets < N_QUERIES))
-
-class FlashAttention2Triton(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k,v, is_causal=False):
-        B,S,D = q.shape
-        scale = 1.0 / math.sqrt(D)
-        Bq = 32
-        Bk = 32
-        o = torch.empty((B, S, D), device=q.device, dtype=q.dtype)
-        L = torch.empty((B, S), device=q.device, dtype=torch.float32)
-        grid = (triton.cdiv(S, Bq), B)
-        flash_fwd_kernel[grid](
-            q,k,v,
-            o,L,
-            q.stride[0],q.stride[1],q.stride[2],
-            k.stride[0],k.stride[1],k.stride[2],
-            v.stride[0],v.stride[1],v.stride[2],
-            o.stride[0],o.stride[1],o.stride[2],
-            L.stride[0],L.stride[1],
-            N_QUERIES=S,
-            N_KEYS=k.shape[1],
-            scale=scale,
-            D=D,Q_TILE_SIZE=Bq,
-            K_TILE_SIZE=Bk,
-            IS_CAUSAL=is_causal,
-            num_warps=4
-        )
-        # save for backward
-        ctx.save_for_backward(L, q, k, v, o)
-        ctx.is_causal = is_causal
-        return o
+# class FlashAttention2Triton(torch.autograd.Function):
+#     @staticmethod
+#     def forward(ctx, q, k,v, is_causal=False):
+#         B,S,D = q.shape
+#         scale = 1.0 / math.sqrt(D)
+#         Bq = 32
+#         Bk = 32
+#         o = torch.empty((B, S, D), device=q.device, dtype=q.dtype)
+#         L = torch.empty((B, S), device=q.device, dtype=torch.float32)
+#         grid = (triton.cdiv(S, Bq), B)
+#         flash_fwd_kernel[grid](
+#             q,k,v,
+#             o,L,
+#             q.stride[0],q.stride[1],q.stride[2],
+#             k.stride[0],k.stride[1],k.stride[2],
+#             v.stride[0],v.stride[1],v.stride[2],
+#             o.stride[0],o.stride[1],o.stride[2],
+#             L.stride[0],L.stride[1],
+#             N_QUERIES=S,
+#             N_KEYS=k.shape[1],
+#             scale=scale,
+#             D=D,Q_TILE_SIZE=Bq,
+#             K_TILE_SIZE=Bk,
+#             IS_CAUSAL=is_causal,
+#             num_warps=4
+#         )
+#         # save for backward
+#         ctx.save_for_backward(L, q, k, v, o)
+#         ctx.is_causal = is_causal
+#         return o
 
 
 
