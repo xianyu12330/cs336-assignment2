@@ -71,16 +71,11 @@ def run_operation2(dim: int, operation: Callable) -> Callable:
     # Return a function to perform the operation
     return lambda : operation(x, y)
 if __name__ == "__main__":
-    if cuda_gelu is not None:
-        check_equal(cuda_gelu, manual_gelu)
+    manual_time = benchmark("manual_softmax", run_operation1(dim=16384, operation=manual_softmax)) # @inspect manual_time
+    compiled_time = benchmark("compiled_softmax", run_operation1(dim=16384, operation=compiled_softmax)) # @inspect compiled_time
+    pytorch_time = benchmark("pytorch_softmax", run_operation1(dim=16384, operation=pytorch_softmax)) # @inspect pytorch_time
+    triton_time = benchmark("triton_softmax", run_operation1(dim=16384, operation=triton_softmax)) # @inspect triton_time
 
-    pytorch_time = benchmark("pytorch_gelu", run_operation1(dim=16384, operation=pytorch_gelu))  # @inspect pytorch_time
-    manual_time = benchmark("manual_gelu", run_operation1(dim=16384, operation=manual_gelu))  # @inspect manual_time
-    if cuda_gelu is not None:
-        cuda_time = benchmark("cuda_gelu", run_operation1(dim=16384, operation=cuda_gelu))  # @inspect cuda_time
-        cuda_gelu_profile = profile("cuda_gelu", run_operation1(dim=16384, operation=cuda_gelu))
-
-    print(mlp_profile)
 
 
 

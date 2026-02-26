@@ -1,7 +1,8 @@
 import math
 
 import torch
-
+import triton
+import triton.language as tl
 
 
 class FlashAttention2_PyTorch(torch.autograd.Function):
@@ -84,19 +85,57 @@ class FlashAttention2_PyTorch(torch.autograd.Function):
 
 @triton.jit
 def flash_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr,
-    O_ptr, L_ptr,
-    stride_qb, stride_qq, stride_qd,
+    Q_ptr, K_ptr, V_ptr,#指向数据在显存中起始位置的基指针
+    O_ptr, L_ptr,#Output输出矩阵和logsumexp辅助矩阵的指针
+    stride_qb, #移动到下一个 Batch 需要跳过的距离。
+    stride_qq, #移动到下一个 Query 序列位置需要跳过的距离。
+    stride_qd,#移动到下一个特征维度需要跳过的距离。
     stride_kb, stride_kk, stride_kd,
     stride_vb, stride_vk, stride_vd,
-    stride_ob, stride_oq, stride_od,
-    stride_lb, stride_lq,
-    N_QUERIES, N_KEYS,
+    stride_ob, stride_oq, stride_od,# Output的 strides
+    stride_lb, stride_lq, # Logsumexp的 strides
+    N_QUERIES, N_KEYS,# query,key/value序列的长度
     scale,
-    D: tl.constexpr,
-    Q_TILE_SIZE: tl.constexpr,
-    K_TILE_SIZE: tl.constexpr,
+    D: tl.constexpr,# 每个头的维度
+    Q_TILE_SIZE: tl.constexpr,#Bq
+    K_TILE_SIZE: tl.constexpr,#Bk
 ):
+    #当前这段代码负责处理的块的坐标。
+    pid_q = tl.program_id(0)
+    #表示当前是第几个 Batch
+    pid_b = tl.program_id(1)
+    #每个 program instance 负责：一个 batch 的一个 Q tile
+    #每个 block 计算：Q[pid_b, pid_q_tile, :]
+    q_offsets = pid_q * Q_TILE_SIZE + tl.arange(0,Q_TILE_SIZE)
+    d_offsets = tl.arange(0,D)
+
+    q_ptrs = Q_ptr \
+            + pid_b * stride_qb \
+            + q_offsets[:,None] * stride_qq \
+            + d_offsets[None:,] * stride_qd
+    q = tl.load(q_ptrs,mask=(q_offsets[:,None] < N_QUERIES),other=0.0).to(tl.float32)
+    #初始化 Online Softmax 状态
+    ## 当前最大值
+    m = tl.full((Q_TILE_SIZE,), -float("inf"),tl.float32)#[bq]
+    ## 当前 softmax 分母
+    l = tl.zeros((Q_TILE_SIZE,),tl.float32)
+    ## 当前加权和
+    acc = tl.zeros((Q_TILE_SIZE,D),tl.float32)
+    #每次处理一个 K block
+    for kb in tl.static_range(0,N_KEYS,K_TILE_SIZE):
+        k_offsets = kb + tl.arange(0,K_TILE_SIZE)
+        k_ptrs = K_ptr + pid_b * stride_kb + k_offsets[:,None] * stride_kk
+        v_ptrs = V_ptr + pid_b * stride_vb + k_offsets[:,None] * stride_vk
+        k = tl.load(k_ptrs,mask=(k_offsets[:,None] < N_KEYS),other=0.0).to(tl.float32)
+        v = tl.load(v_ptrs,mask=(k_offsets[:,None] < N_KEYS),other=0.0)
+
+        # S = q @ k^T * scale -> [Bq, Bk]
+        S = tl.dot(q,tl.trans(k)) * scale
+
+        if IS_CAUSAL:
+            
 
 
-class FlashAttention2_triton()
+
+
+
