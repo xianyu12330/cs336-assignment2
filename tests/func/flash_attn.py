@@ -35,7 +35,7 @@ def flash_bwd_recompute_impl(q: torch.Tensor,
     # dQ = dSK /√d->[b,s,k]
     dq = torch.matmul(ds, k)
     # dK = dS⊤Q/√d,
-    dk = torch.matmul(ds.transpose(-1, -2), q) * scale
+    dk = torch.matmul(ds.transpose(-1, -2), q)
     return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 class FlashAttention2_PyTorch(torch.autograd.Function):
     @staticmethod
