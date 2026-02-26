@@ -1,10 +1,42 @@
 import math
+from typing import Any
 
 import torch
 import triton
 import triton.language as tl
+from sympy import false
 
 
+def flash_bwd_recompute_impl(q: torch.Tensor,
+                             k: torch.Tensor,
+                             v: torch.Tensor,
+                             o: torch.Tensor,
+                             do: torch.Tensor,
+                             L: torch.Tensor,
+                             is_causal: bool = false) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, S, D = q.shape
+    K = k.shape[1]
+    scale = 1.0 / math.sqrt(D)
+    s = torch.matmul(q, k.transpose(-1, -2)) * scale
+    if is_causal:
+        q_idx = torch.arange(S, device=q.device)[:, None]
+        k_idx = torch.arange(K, device=k.device)[None, :]
+        causal = q_idx >= k_idx  # []s,k
+        Score = torch.where(causal[None, :, :], s, torch.full_like(s, -1.0e6))  # [s,k] ->[1,s,k]
+    # Pij = exp (Sij − Li)->[b,s,k]
+    p = torch.exp(Score - L.unsqueeze(-1))
+    # dV = P⊤dO->[b,k,d]
+    dv = torch.matmul(p.transpose(-1, -2), do)
+    # dP = dOV⊤
+    dp = torch.matmul(do, torch.transpose(v, -1, -2))
+    # dSij = Pij ◦ (dPij − Di)
+    Devc = (do * o).sum(-1)  # [b,s]
+    ds = p * (dp - Devc.unsqueeze(-1)) * scale
+    # dQ = dSK /√d->[b,s,k]
+    dq = torch.matmul(ds, k)
+    # dK = dS⊤Q/√d,
+    dk = torch.matmul(ds.transpose(-1, -2), q) * scale
+    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 class FlashAttention2_PyTorch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k,v, is_causal=False):
@@ -74,15 +106,13 @@ class FlashAttention2_PyTorch(torch.autograd.Function):
         # 截图要求："return O"
         return O
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        """
-        反向传播定义
-        """
-        # 截图要求："for now you can make it just raise NotImplementedError"
-        # 也就是说第一步你只需要专注前向传播即可
-        raise NotImplementedError("FlashAttention-2 的反向传播暂未实现")
 
+
+    @staticmethod
+    def backward(ctx: Any, do: Any):
+        (L, q, k, v, o) = ctx.saved_tensors
+        dq, dk, dv = flash_bwd_recompute_impl(q, k, v, o, do, L, ctx.is_causal)
+        return dq, dk, dv, None
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,#指向数据在显存中起始位置的基指针
@@ -94,10 +124,11 @@ def flash_fwd_kernel(
     stride_vb, stride_vk, stride_vd,
     stride_ob, stride_oq, stride_od,# Output的 strides
     stride_lb, stride_lq, # Logsumexp的 strides
-    N_QUERIES, N_KEYS,# query,key/value序列的长度
+    N_QUERIES, #相当于总大小
+    N_KEYS,# query,key/value序列的长度
     scale,
     D: tl.constexpr,# 每个头的维度
-    Q_TILE_SIZE: tl.constexpr,#Bq
+    Q_TILE_SIZE: tl.constexpr,#Bq，分块长度，每个 program 处理的数据块大小
     K_TILE_SIZE: tl.constexpr,#Bk
     IS_CAUSAL: tl.constexpr
 ):
@@ -106,10 +137,10 @@ def flash_fwd_kernel(
     #表示当前是第几个 Batch
     pid_b = tl.program_id(1)
     #每个 program instance 负责：一个 batch 的一个 Q tile
-    #每个 block 计算：Q[pid_b, pid_q_tile, :]
+    #每个 block 计算：Q[pid_b, pid_q_tile, :]，每个块的内存范围
     q_offsets = pid_q * Q_TILE_SIZE + tl.arange(0,Q_TILE_SIZE)
     d_offsets = tl.arange(0,D)
-
+    #构造地址Q[pid_b, q_offsets[i], d_offsets[j]]，最终是【bq，d】的指针矩阵
     q_ptrs = Q_ptr \
             + pid_b * stride_qb \
             + q_offsets[:,None] * stride_qq \
@@ -132,8 +163,9 @@ def flash_fwd_kernel(
 
         # S = q @ k^T * scale -> [Bq, Bk]
         S = tl.dot(q,tl.trans(k)) * scale
-
+        #强制 attention 只看过去 token
         if IS_CAUSAL:
+            #q，k的相对位置
             q_ads = q_offsets[:,None] #[bq,1]
             k_ads = k_offsets[None,:] #[1,bk]
             causal = q_ads >= k_ads
