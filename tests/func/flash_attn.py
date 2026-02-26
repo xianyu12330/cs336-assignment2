@@ -99,6 +99,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,# 每个头的维度
     Q_TILE_SIZE: tl.constexpr,#Bq
     K_TILE_SIZE: tl.constexpr,#Bk
+    IS_CAUSAL: tl.constexpr
 ):
     #当前这段代码负责处理的块的坐标。
     pid_q = tl.program_id(0)
@@ -133,8 +134,63 @@ def flash_fwd_kernel(
         S = tl.dot(q,tl.trans(k)) * scale
 
         if IS_CAUSAL:
-            
+            q_ads = q_offsets[:,None] #[bq,1]
+            k_ads = k_offsets[None,:] #[1,bk]
+            causal = q_ads >= k_ads
+            S = tl.where(causal,S,-1.0e6)
 
+        # online softmax update
+        m_new = tl.maximum(m,tl.max(S,axis=1))
+        #计算当前块的 exp
+        p = tl.exp(S - m_new[:,None])
+        #修正旧分母
+        alpha = tl.exp(m - m_new)
+        l_new = alpha * l + tl.sum(p,axis=1)
+        #更新输出累加
+        p = p.to(v.dtype)
+        acc = alpha[:,None] * acc + tl.dot(p,v)
+        #计算最终输出
+        m = m_new
+        l = l_new
+    o = acc / l[:,None]
+    o = o.to(tl.float32)
+    o_ptrs = O_ptr + pid_b * stride_ob + q_offsets[:, None] * stride_oq + d_offsets[None, :] * stride_od
+    tl.store(o_ptrs, o, mask=(q_offsets[:, None] < N_QUERIES))
+
+    L_out = m + tl.log(l)  # [Bq]
+    l_ptrs = L_ptr + pid_b * stride_lb + q_offsets * stride_lq
+    tl.store(l_ptrs, L_out, mask=(q_offsets < N_QUERIES))
+
+class FlashAttention2Triton(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k,v, is_causal=False):
+        B,S,D = q.shape
+        scale = 1.0 / math.sqrt(D)
+        Bq = 32
+        Bk = 32
+        o = torch.empty((B, S, D), device=q.device, dtype=q.dtype)
+        L = torch.empty((B, S), device=q.device, dtype=torch.float32)
+        grid = (triton.cdiv(S, Bq), B)
+        flash_fwd_kernel[grid](
+            q,k,v,
+            o,L,
+            q.stride[0],q.stride[1],q.stride[2],
+            k.stride[0],k.stride[1],k.stride[2],
+            v.stride[0],v.stride[1],v.stride[2],
+            o.stride[0],o.stride[1],o.stride[2],
+            L.stride[0],L.stride[1],
+            N_QUERIES=S,
+            N_KEYS=k.shape[1],
+            scale=scale,
+            D=D,Q_TILE_SIZE=Bq,
+            K_TILE_SIZE=Bk,
+            IS_CAUSAL=is_causal,
+            num_warps=4
+        )
+        # save for backward
+        ctx.save_for_backward(L, q, k, v, o)
+        ctx.is_causal = is_causal
+        return o
 
 
 
