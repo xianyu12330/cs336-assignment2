@@ -156,7 +156,7 @@ def flash_fwd_kernel(
     ## 当前加权和
     acc = tl.zeros((Q_TILE_SIZE, D), tl.float32)
     # 每次处理一个 K block
-    for kb in tl.static_range(0, N_KEYS, K_TILE_SIZE):
+    for kb in range(0, N_KEYS, K_TILE_SIZE):
         k_offsets = kb + tl.arange(0, K_TILE_SIZE)
         k_ptrs = K_ptr + pid_b * stride_kb + k_offsets[:, None] * stride_kk + d_offsets[None, :] * stride_kd
         v_ptrs = V_ptr + pid_b * stride_vb + k_offsets[:, None] * stride_vk + d_offsets[None, :] * stride_vd
@@ -271,7 +271,7 @@ def flash_bwd_kernel(
     # =================================================================
     # 内层循环：遍历所有的 K, V 块
     # =================================================================
-    for kb in tl.static_range(0, N_KEYS, K_TILE_SIZE):
+    for kb in tl.range(0, N_KEYS, K_TILE_SIZE):
         # TODO 3: 计算当前 K/V 块的偏移量 k_offsets [Bk]
         k_offsets = kb + tl.arange(0, K_TILE_SIZE)
 
@@ -280,7 +280,7 @@ def flash_bwd_kernel(
         # 2. 加载 k, v (使用 mask 保护)
         k_ptrs = K_ptr + pid_b * stride_kb + k_offsets[:, None] * stride_kk + b_offsets[None, :] * stride_kd
         v_ptrs = V_ptr + pid_b * stride_vb + k_offsets[:, None] * stride_vk + b_offsets[None, :] * stride_vd
-        k = tl.load(k_ptrs, mask=(k_offsets[:, None] < N_KEYS), other=0.0).to(tl.float32)
+        k = tl.load(k_ptrs, mask=(k_offsets[:, None] < N_KEYS), other=0.0)
         v = tl.load(v_ptrs, mask=(k_offsets[:, None] < N_KEYS), other=0.0)
         # =================================================================
         # TODO 5: 重算局部 Attention 分数 P
